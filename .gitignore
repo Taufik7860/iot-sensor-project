@@ -1,0 +1,6 @@
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+backend/*.db
+__pycache__/
+.vscode/
