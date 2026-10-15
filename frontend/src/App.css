@@ -946,6 +946,30 @@ footer strong {
   color: #cbd5e1;
 }
 
+.solar-disclaimer {
+  padding: 12px 14px;
+  border-left: 2px solid var(--cyan);
+  border-radius: 0 10px 10px 0;
+  background: rgba(34, 211, 238, 0.06);
+  font-size: 12px !important;
+}
+
+.reading-note {
+  min-height: 18px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.light-card::after {
+  background: #facc15;
+}
+
+.rain-card::after {
+  background: #38bdf8;
+}
+
 /* ======================================
    RESPONSIVE
 ====================================== */
@@ -997,6 +1021,10 @@ footer strong {
 
   .hero-content {
     order: 1;
+  }
+
+  .solar-disclaimer {
+    font-size: 11px !important;
   }
 
   .hero-model {

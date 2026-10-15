@@ -1,852 +1,564 @@
-Offline IoT Sensor Monitor — Arduino UNO
+# Solar Guard
 
+Solar Guard is a local IoT dashboard for monitoring the environment around a
+solar panel. An Arduino UNO reads a DHT11, an LDR, a rain sensor, and an analog
+voltage input, then sends JSON readings to a Python backend over USB serial.
+The backend stores readings in SQLite and serves a React dashboard in your
+browser.
 
+The system is designed to run locally. It does not need an ESP32, Wi-Fi, a
+cloud account, or a hosted database. Internet access is needed for the initial
+dependency installation unless the packages are already available locally.
 
-from pathlib import Path
+> **Measurement note:** The dashboard's estimated performance index is a
+> relative project indicator calculated from the LDR light percentage and the
+> A2 input voltage. It is not a measurement of actual solar-panel efficiency.
+> Do not connect a panel voltage that can exceed the Arduino UNO's 5 V analog
+> input limit directly to A2.
 
-source = Path("/mnt/data/README-IoT-Sensor-Monitor.md")
-text = source.read_text(encoding="utf-8")
+## Contents
 
-text = text.replace(
-"""```text
-Sensors
-   │
-   ▼
-Arduino UNO ──USB serial / 9600 baud──► Python + pySerial
-                                            │
-                                            ├──► SQLite database
-                                            │
-                                            └──► Flask API (127.0.0.1:5000)
-                                                         │
-                                                         ▼
-                                                React dashboard
-```""",
-"""```mermaid
+- [Features](#features)
+- [Architecture](#architecture)
+- [Workflow](#workflow)
+- [Methodology](#methodology)
+- [Technology stack](#technology-stack)
+- [Project structure](#project-structure)
+- [Hardware and wiring](#hardware-and-wiring)
+- [Prerequisites](#prerequisites)
+- [Setup and run from PowerShell](#setup-and-run-from-powershell)
+- [Development commands](#development-commands)
+- [Serial protocol and API](#serial-protocol-and-api)
+- [Database](#database)
+- [Troubleshooting](#troubleshooting)
+- [Offline operation](#offline-operation)
+
+## Features
+
+- Live sensor dashboard for light, rain, input voltage, temperature, and
+  humidity.
+- Arduino communication over USB serial at 9600 baud.
+- JSON-lines sensor protocol, with support for the backend's legacy
+  three-value CSV input format.
+- Local SQLite history; no database server is required.
+- Serial-port reconnect handling and configurable COM-port selection.
+- Flask API endpoints for the latest reading and recent history.
+- React dashboard served by Flask in the normal production run mode.
+- Vite development server and npm lint/build scripts.
+- Optional local MP4 background video with a CSS fallback.
+
+## Architecture
+
+### System architecture
+
+```mermaid
+flowchart LR
+    subgraph Hardware["Hardware"]
+        Sensors["DHT11, LDR, rain module, voltage input"]
+        Arduino["Arduino UNO"]
+        Sensors --> Arduino
+    end
+
+    subgraph Backend["Python backend"]
+        Serial["pySerial reader"]
+        Parser["Parse and validate JSON readings"]
+        SQLite[("SQLite readings database")]
+        Flask["Flask API and static file server"]
+        Serial --> Parser
+        Parser --> SQLite
+        Parser --> Flask
+        SQLite --> Flask
+    end
+
+    subgraph Frontend["React frontend"]
+        React["React 19 dashboard"]
+        Vite["Vite build and development server"]
+        React --- Vite
+    end
+
+    Browser["Browser"]
+    Arduino -->|"USB serial, 9600 baud"| Serial
+    Browser -->|"GET /api/sensor and /api/history"| Flask
+    Flask -->|"Built frontend files"| Browser
+    React -->|"Poll API every second"| Flask
+```
+
+The Arduino writes one JSON object followed by a newline about every two
+seconds. A background thread in Flask reads the serial stream, validates
+numeric values, and stores each valid reading in `backend/sensor_data.db`.
+The browser requests the API once per second. During a normal run, Flask also
+serves the built React app at `http://localhost:5000/`.
+
+### Reading lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Sensor as Sensors
+    participant Board as Arduino UNO
+    participant Reader as pySerial reader
+    participant DB as SQLite
+    participant API as Flask API
+    participant UI as React dashboard
+
+    loop About every 2 seconds
+        Sensor->>Board: Analog and digital measurements
+        Board->>Reader: JSON line over USB at 9600 baud
+        Reader->>Reader: Parse and validate numeric fields
+        Reader->>DB: Insert valid reading with timestamp
+    end
+
+    loop Every 1 second
+        UI->>API: GET /api/sensor
+        API->>DB: Read latest saved record
+        DB-->>API: Latest values and timestamp
+        API-->>UI: JSON response and connection status
+        UI->>UI: Refresh readings and status indicators
+    end
+```
+
+## Workflow
+
+### First-time setup and launch
+
+```mermaid
 flowchart TD
-    A["Sensors"] --> B["Arduino UNO"]
-    B -->|"USB serial · 9600 baud"| C["Python + pySerial"]
-    C --> D[("SQLite database")]
-    C --> E["Flask API · 127.0.0.1:5000"]
-    E --> F["React dashboard"]
-    F --> G["Browser · localhost:5000"]
-```"""
-)
+    A["Install Python, Node.js, Git, and Arduino IDE"] --> B["Wire sensors and upload sensor.ino"]
+    B --> C["Create Python virtual environment"]
+    C --> D["Install backend requirements"]
+    D --> E["Install frontend npm dependencies"]
+    E --> F["Connect Arduino and close Serial Monitor"]
+    F --> G["Choose COM port or use default COM5"]
+    G --> H["Run start_app.bat"]
+    H --> I["Launcher builds frontend offline"]
+    I --> J["Flask starts and opens dashboard"]
+    J --> K{"Arduino data arriving?"}
+    K -->|Yes| L["View live readings"]
+    K -->|No| M["Check port, cable, wiring, and serial output"]
+    M --> H
+```
 
-text = text.replace(
-"""```text
+### Development workflow
+
+1. Edit and upload `arduino/sensor.ino` using Arduino IDE.
+2. Update the Flask serial parser or API in `backend/app.py` if the data
+   contract changes.
+3. Update the dashboard in `frontend/src/App.jsx` and its styles in
+   `frontend/src/App.css`.
+4. Run the backend and Vite development server in separate terminals.
+5. Verify the API response and the live dashboard.
+6. Run the frontend linter and production build before sharing changes.
+
+## Methodology
+
+1. **Acquire:** The sketch samples its connected sensors and emits one
+   newline-terminated JSON object every two seconds over USB serial. The
+   firmware uses 9600 baud.
+2. **Parse and validate:** The backend reads serial lines, converts sensor
+   values to finite numbers or `null`, and ignores malformed readings. It
+   accepts extra numeric JSON fields so additional supported readings can be
+   persisted without changing the database schema. A legacy CSV format with
+   three values is also accepted.
+3. **Persist:** Each valid reading is written to a local SQLite table with a
+   timestamp. The database file is created automatically when the backend
+   starts.
+4. **Serve:** Flask exposes the latest record and up to 50 recent records as
+   JSON. It also serves the production frontend from `frontend/dist`.
+5. **Present:** React polls the latest-reading endpoint every second and
+   updates the dashboard. When the serial feed is stale or unavailable, the
+   interface reports the connection state instead of presenting old values
+   as live.
+6. **Recover:** The backend retries serial connections. Set `ARDUINO_PORT` to
+   a specific COM port for a fixed device, or set it to `AUTO` to scan
+   detected serial devices.
+
+## Technology stack
+
+| Layer | Technology | Purpose |
+| --- | --- | --- |
+| Microcontroller | Arduino UNO | Samples sensor inputs and sends JSON over USB |
+| Firmware | Arduino C++ | Reads DHT11, analog, and digital sensor signals |
+| Temperature/humidity library | Adafruit DHT sensor library | Reads the DHT11 module |
+| Backend runtime | Python 3 | Serial reader, API, and database logic |
+| Serial communication | pySerial | Finds and reads the Arduino COM port |
+| Web API | Flask | Provides JSON endpoints and serves the built frontend |
+| Cross-origin support | Flask-CORS | Allows the Vite development UI to call Flask |
+| Database | SQLite via Python `sqlite3` | Stores sensor history locally |
+| Frontend | React 19 | Renders the live dashboard |
+| Frontend build/dev server | Vite 8 and `@vitejs/plugin-react` | Builds the dashboard and supports hot reload |
+| 3D/visualization dependencies | Three.js, React Three Fiber, Drei | Frontend visualization dependencies |
+| Frontend linting | oxlint | Checks frontend source |
+| Launcher | Windows batch (`start_app.bat`) | Builds and starts the local app |
+
+Python dependencies are listed in `backend/requirements.txt`. Frontend
+dependencies and scripts are defined in `frontend/package.json` and pinned by
+`frontend/package-lock.json`.
+
+## Project structure
+
+```text
 iot-sensor-project/
-├── .gitignore
 ├── README.md
+├── .gitignore
+├── package.json
+├── package-lock.json
 ├── start_app.bat
 ├── arduino/
 │   └── sensor.ino
 ├── backend/
 │   ├── app.py
-│   └── requirements.txt
+│   ├── requirements.txt
+│   └── sensor_data.db        # created at runtime; do not commit local data
 └── frontend/
-    ├── .gitignore
     ├── index.html
     ├── package.json
-    ├── package-lock.json          # generated by npm install
+    ├── package-lock.json
     ├── vite.config.js
     ├── public/
-    │   └── Video Project 1.mp4    # optional local background video
+    │   └── Video Project 1.mp4
     └── src/
         ├── App.jsx
         ├── App.css
         └── main.jsx
-```""",
-"""```mermaid
-flowchart TD
-    ROOT["iot-sensor-project/"]
-    ROOT --> GI[".gitignore"]
-    ROOT --> README["README.md"]
-    ROOT --> BAT["start_app.bat"]
-    ROOT --> ARD["arduino/"]
-    ROOT --> BACK["backend/"]
-    ROOT --> FRONT["frontend/"]
-
-    ARD --> INO["sensor.ino"]
-
-    BACK --> APP["app.py"]
-    BACK --> REQ["requirements.txt"]
-    BACK --> DB["sensor_data.db · generated at runtime"]
-
-    FRONT --> FGI[".gitignore"]
-    FRONT --> HTML["index.html"]
-    FRONT --> PKG["package.json"]
-    FRONT --> LOCK["package-lock.json"]
-    FRONT --> VITE["vite.config.js"]
-    FRONT --> PUBLIC["public/"]
-    FRONT --> SRC["src/"]
-
-    PUBLIC --> VIDEO["Video Project 1.mp4 · optional"]
-    SRC --> JSX["App.jsx"]
-    SRC --> CSS["App.css"]
-    SRC --> MAIN["main.jsx"]
-```"""
-)
-
-
-
-
-
-# Add a Mermaid-focused quick overview near the top, while keeping prose and commands
-# because Mermaid is diagram syntax and cannot replace executable commands or detailed explanations.
-insert = """## Mermaid overview
-
-The following Mermaid diagrams summarise the complete project architecture and the rebuild/run workflow. The detailed instructions and commands in the sections below are the source of truth for installation.
-
-### End-to-end data flow
-
-```mermaid
-flowchart LR
-    S["Physical sensors"] --> U["Arduino UNO"]
-    U -->|"JSON lines over USB serial · 9600 baud"| PY["Python serial reader"]
-    PY --> VALIDATE["Parse and validate readings"]
-    VALIDATE --> SQLITE[("SQLite · local history")]
-    VALIDATE --> API["Flask REST API"]
-    API --> UI["React + Vite dashboard"]
-    UI --> BROWSER["Browser · localhost:5000"]
-
-A local-first IoT dashboard that reads sensor values from an Arduino UNO over USB serial, saves readings to SQLite, and displays them in a React dashboard served by a local Flask backend.
-
-Important: This version uses Arduino UNO only—no ESP32 and no cloud database. SQLite is stored locally on the computer, so normal monitoring works without internet after the required software packages have been installed.
-
-Mermaid overview
-
-The following Mermaid diagrams summarise the complete project architecture and the rebuild/run workflow. The detailed instructions and commands in the sections below are the source of truth for installation.
-
-End-to-end data flow
-
-flowchart LR
-    S["Physical sensors"] --> U["Arduino UNO"]
-    U -->|"JSON lines over USB serial · 9600 baud"| PY["Python serial reader"]
-    PY --> VALIDATE["Parse and validate readings"]
-    VALIDATE --> SQLITE[("SQLite · local history")]
-    VALIDATE --> API["Flask REST API"]
-    API --> UI["React + Vite dashboard"]
-    UI --> BROWSER["Browser · localhost:5000"]
-
-Rebuild and launch workflow
-
-flowchart TD
-    A["Install Arduino IDE, Python, Node.js"] --> B["Create project folders"]
-    B --> C["Upload arduino/sensor.ino"]
-    C --> D["Create Python virtual environment"]
-    D --> E["Install backend/requirements.txt"]
-    E --> F["Create/install React + Vite frontend"]
-    F --> G["Add backend/app.py and frontend source"]
-    G --> H["Run npm run build"]
-    H --> I["Connect Arduino by USB"]
-    I --> J["Run start_app.bat"]
-    J --> K{"Backend and serial connection OK?"}
-    K -->|Yes| L["Open http://localhost:5000"]
-    K -->|No| M["Check COM port, baud rate, dependencies, and port 5000"]
-    M --> J
-
-Runtime decision flow
-
-flowchart TD
-    START["Start backend"] --> PORT["Find Arduino serial port"]
-    PORT --> FOUND{"Port found?"}
-    FOUND -->|No| RETRY["Report disconnected status and retry"]
-    RETRY --> PORT
-    FOUND -->|Yes| READ["Read one serial line"]
-    READ --> JSON{"Valid JSON and sensor values?"}
-    JSON -->|No| READ
-    JSON -->|Yes| SAVE["Save reading to SQLite"]
-    SAVE --> API["Expose latest values through /api/sensor"]
-    API --> FRONT["Frontend polls API"]
-    FRONT --> DISPLAY["Update dashboard cards"]
-    DISPLAY --> READ
-
-Main software responsibilities
-
-flowchart TB
-    subgraph Hardware
-        ARD["Arduino UNO"]
-        SENS["HC-SR04 and optional sensors"]
-        SENS --> ARD
-    end
-    subgraph Backend["Python backend"]
-        SERIAL["pySerial"]
-        FLASK["Flask routes"]
-        SQLITE["sqlite3 storage"]
-        SERIAL --> FLASK
-        FLASK --> SQLITE
-    end
-    subgraph Frontend["Frontend"]
-        REACT["React UI · App.jsx"]
-        STYLE["CSS · App.css"]
-        ENTRY["main.jsx"]
-        ENTRY --> REACT
-        STYLE -. styles .-> REACT
-    end
-    ARD -->|"USB / JSON"| SERIAL
-    FLASK -->|"GET /api/sensor"| REACT
-
-Contents
-
-Features
-
-How it works
-
-Project structure
-
-Hardware
-
-Software prerequisites
-
-Build from scratch
-
-Run the project
-
-Arduino wiring
-
-Add optional sensors
-
-SQLite database
-
-API reference
-
-Troubleshooting
-
-Offline behaviour
-
-Git and clean repository
-
-Features
-
-Arduino UNO communicates with the computer through USB serial at 9600 baud.
-
-HC-SR04 ultrasonic sensor measures distance in centimetres.
-
-Optional sensors can send additional numeric values; the dashboard creates cards for received sensor keys.
-
-React + Vite frontend with a responsive dashboard.
-
-Flask backend reads the serial port, exposes a local JSON API, and serves the production frontend.
-
-SQLite stores sensor readings locally.
-
-Automatic serial-port scanning and reconnect handling.
-
-No Supabase, hosted database, ESP32, or internet connection is required for normal local operation.
-
-How it works
-
-flowchart TD
-    A["Sensors"] --> B["Arduino UNO"]
-    B -->|"USB serial · 9600 baud"| C["Python + pySerial"]
-    C --> D[("SQLite database")]
-    C --> E["Flask API · 127.0.0.1:5000"]
-    E --> F["React dashboard"]
-    F --> G["Browser · localhost:5000"]
-
-The Arduino sends one JSON object per line. The Python backend reads each line, validates values, stores readings in SQLite, and makes the latest values available at /api/sensor. The frontend polls this endpoint approximately once per second.
-
-Project structure
-
-This is the source structure to create and commit. Dependency folders and generated build output are intentionally excluded.
-
-flowchart TD
-    ROOT["iot-sensor-project/"]
-    ROOT --> GI[".gitignore"]
-    ROOT --> README["README.md"]
-    ROOT --> BAT["start_app.bat"]
-    ROOT --> ARD["arduino/"]
-    ROOT --> BACK["backend/"]
-    ROOT --> FRONT["frontend/"]
-
-    ARD --> INO["sensor.ino"]
-
-    BACK --> APP["app.py"]
-    BACK --> REQ["requirements.txt"]
-    BACK --> DB["sensor_data.db · generated at runtime"]
-
-    FRONT --> FGI[".gitignore"]
-    FRONT --> HTML["index.html"]
-    FRONT --> PKG["package.json"]
-    FRONT --> LOCK["package-lock.json"]
-    FRONT --> VITE["vite.config.js"]
-    FRONT --> PUBLIC["public/"]
-    FRONT --> SRC["src/"]
-
-    PUBLIC --> VIDEO["Video Project 1.mp4 · optional"]
-    SRC --> JSX["App.jsx"]
-    SRC --> CSS["App.css"]
-    SRC --> MAIN["main.jsx"]
-
-Files and folders
-
-Path
-
-Purpose
-
-arduino/sensor.ino
-
-Arduino sketch: reads sensors and prints JSON serial data.
-
-backend/app.py
-
-Flask API, USB serial connection, parsing/validation, SQLite storage, and serving built frontend.
-
-backend/requirements.txt
-
-Python dependencies: Flask, Flask-CORS, pySerial.
-
-backend/sensor_data.db
-
-Created automatically at runtime; stores local sensor history. Do not commit this database unless you intentionally want to publish sample data.
-
-frontend/src/App.jsx
-
-React dashboard and API polling.
-
-frontend/src/App.css
-
-Dashboard styling and responsive layout.
-
-frontend/src/main.jsx
-
-React application entry point.
-
-frontend/index.html
-
-HTML page Vite uses.
-
-frontend/vite.config.js
-
-Vite development server configuration.
-
-frontend/package.json
-
-React, Vite, Three.js and related frontend dependencies.
-
-frontend/package-lock.json
-
-Locks the npm dependency versions for repeatable installs.
-
-frontend/public/Video Project 1.mp4
-
-Optional background video. Remove the video element/reference in App.jsx if you do not want a video background.
-
-start_app.bat
-
-Windows launcher: builds frontend from local npm packages, then starts Flask.
-
-.gitignore
-
-Keeps environments, dependencies, databases, and generated files out of Git.
-
-Generated folders such as .venv/, frontend/node_modules/, frontend/dist/, __pycache__/ are not source code and should normally not be committed.
-
-Hardware
-
-Required
-
-Arduino UNO (or compatible board)
-
-USB data cable (not a charge-only cable)
-
-HC-SR04 ultrasonic distance sensor
-
-Jumper wires
-
-Computer running Windows for the provided start_app.bat
-
-Optional modules supported by the sketch
-
-DHT11 temperature/humidity
-
-PIR motion sensor
-
-LDR light sensor
-
-Soil moisture sensor
-
-MQ-2 gas sensor
-
-Rain sensor
-
-Water-level sensor
-
-Flame sensor
-
-IR obstacle sensor
-
-Sound sensor
-
-Vibration sensor
-
-The sketch has optional sensor sections commented out by default. You only need to connect and enable modules you actually have.
-
-Software prerequisites
-
-Install these once while online:
-
-Arduino IDE — to edit and upload arduino/sensor.ino.
-
-Python 3 — use a version supported by the installed Flask and pySerial packages.
-
-Node.js LTS, which includes npm.
-
-Git (optional, for cloning and contributing).
-
-A USB serial driver if your UNO-compatible board needs one.
-
-Check installations in PowerShell:
-
-python --version
+```
+
+Generated folders such as `.venv/`, `frontend/node_modules/`,
+`frontend/dist/`, and `__pycache__/` are created locally and should not be
+committed. The SQLite database is runtime data and should also remain
+untracked.
+
+## Hardware and wiring
+
+### Required hardware
+
+- Arduino UNO or compatible board.
+- USB data cable.
+- DHT11 module.
+- LDR module.
+- Rain sensor module with analog and digital outputs.
+- Potentiometer or safe 0-5 V signal source for the A2 voltage input.
+- Jumper wires.
+
+### Pin mapping
+
+| Sensor/module | Arduino connection | Dashboard data |
+| --- | --- | --- |
+| DHT11 | Data to D3; power and ground to module-rated pins | `temperature`, `humidity` |
+| LDR | Analog output to A0 | `ldr`, `light_percent`, `daylight` |
+| Rain module | Analog output to A1; digital output to D2 | `rain_analog`, `rain_digital`, `rain_detected` |
+| Potentiometer / voltage input | Wiper to A2; outer pins to 5V and GND | `panel_voltage` |
+| All modules | Common ground to Arduino GND | Required reference |
+
+Check the voltage requirements for each module before wiring. Do not connect
+an input above 5 V directly to an Arduino UNO analog pin. If measuring a
+higher-voltage source, use a correctly rated voltage divider and a common
+ground. The A2 input conversion assumes a 5 V ADC reference; with a
+potentiometer it is a demonstration input rather than a calibrated panel
+measurement.
+
+Install **DHT sensor library by Adafruit** and **Adafruit Unified Sensor** in
+Arduino IDE's Library Manager. Then:
+
+1. Open `arduino/sensor.ino`.
+2. Select the Arduino UNO board and its USB port.
+3. Upload the sketch.
+4. If checking output in Serial Monitor, set it to 9600 baud.
+5. Close Serial Monitor before starting the backend; only one process can
+   normally own a COM port at a time.
+
+The sketch assumes a higher LDR ADC value means brighter light and that the
+rain module's digital output is LOW when wet. Adjust
+`BRIGHTER_WHEN_ADC_HIGHER`, `DAYLIGHT_ADC_THRESHOLD`, or
+`RAIN_DETECTED_WHEN_DO_LOW` in `arduino/sensor.ino` to match your modules, then
+upload the sketch again.
+
+## Prerequisites
+
+Install the following on Windows:
+
+- Python 3 and the Python launcher (`py`), or a `python` command.
+- Node.js LTS with npm; use a version supported by the installed Vite release.
+- Arduino IDE and the two DHT libraries listed above.
+- A USB serial driver if required by your Arduino-compatible board.
+- Git, if cloning the repository.
+
+Check that the tools are on `PATH` in PowerShell:
+
+```powershell
 py --version
+python --version
 node --version
 npm --version
 git --version
+```
 
-If python does not work but the Python launcher is installed, use py in the environment creation step below.
+If `py` is unavailable but `python` works, use `python` instead of `py` in the
+virtual-environment creation command below.
 
-Build from scratch
+## Setup and run from PowerShell
 
-Step 1 — Create the project folders
+Run these commands from the repository root. If you already have the
+repository open, start at **Create the Python environment**.
 
-Open PowerShell and choose where the project should live:
+### Optional: clone the repository
 
-mkdir iot-sensor-project
-cd iot-sensor-project
+```powershell
+git clone https://github.com/alitaufik990-dev/iot-sensor.git
+Set-Location .\iot-sensor
+```
 
-mkdir arduino
-mkdir backend
-mkdir frontend
-mkdir frontend\src
-mkdir frontend\public
+### 1. Create the Python environment and install the backend
 
-Create the files shown in Project structure, then paste the code for each file into it. If you are rebuilding this existing project, copy the source files from the repository rather than writing the complete application from zero.
-
-Step 2 — Create the Arduino sketch
-
-Create arduino/sensor.ino.
-
-Open Arduino IDE.
-
-Open the sketch.
-
-Select Tools → Board → Arduino AVR Boards → Arduino Uno (menu wording may differ by IDE version).
-
-Select the correct USB port under Tools → Port.
-
-Connect HC-SR04: VCC → 5V, GND → GND, TRIG → D9, ECHO → D10.
-
-Upload the sketch.
-
-Open Serial Monitor and set 9600 baud. You should see one JSON line per second, similar to:
-
-{"temperature":null,"humidity":null,"distance":24.5}
-
-Temperature and humidity are null until DHT support is enabled and the module is connected. Close Serial Monitor before starting the Python backend, because only one program can normally own the COM port at a time.
-
-Step 3 — Create a Python virtual environment
-
-From the project root:
-
+```powershell
 py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+```
+
+The virtual environment's Python executable is used directly, so activation is
+not required. If you prefer to activate it in PowerShell:
+
+```powershell
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-
-If PowerShell blocks activation, you can avoid activation and use the environment's Python directly:
-
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-
-Step 4 — Install backend packages
-
-Create backend/requirements.txt with:
-
-Flask
-flask-cors
-pyserial
-
-Install them:
-
 python -m pip install -r backend\requirements.txt
+```
 
-If you did not activate the environment, run:
+If PowerShell blocks activation, continue using
+`.\.venv\Scripts\python.exe` as in the first set of commands.
 
-.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+### 2. Install frontend dependencies
 
-Step 5 — Create the React + Vite frontend
+```powershell
+npm --prefix frontend install
+```
 
-From the project root:
+### 3. Select the Arduino serial port
 
-cd frontend
-npm create vite@latest . -- --template react
-npm install
-npm install three @react-three/fiber @react-three/drei
-cd ..
+The project defaults to `COM5`. If your board uses another port, set it in the
+same PowerShell window before launching:
 
-When asked to confirm using a non-empty directory, proceed only if the files in it are safe to replace. Otherwise create the Vite app in an empty folder first and copy the generated files into frontend.
+```powershell
+$env:ARDUINO_PORT = "COM8"
+```
 
-Replace the generated source files with the project's src/App.jsx, src/App.css, and src/main.jsx. Keep the Vite-generated package.json and package-lock.json, or use the versions in this repository. Run:
+Replace `COM8` with the port shown in Windows Device Manager. To ask the
+backend to scan serial devices automatically instead:
 
-cd frontend
-npm run build
-cd ..
+```powershell
+$env:ARDUINO_PORT = "AUTO"
+```
 
-This generates frontend/dist/, which Flask serves in production mode. dist/ is generated output; do not edit its files directly.
+To return to the default `COM5` behavior in the current terminal:
 
-Step 6 — Add the local video (optional)
+```powershell
+Remove-Item Env:ARDUINO_PORT -ErrorAction SilentlyContinue
+```
 
-Copy your MP4 file to:
+### 4. Start the production-style local app
 
-frontend/public/Video Project 1.mp4
+Connect the Arduino, close Arduino IDE Serial Monitor, and run:
 
-The frontend references it as /Video%20Project%201.mp4. If you use a different filename, update VIDEO_URL in frontend/src/App.jsx. The video is optional; keep a CSS fallback so the dashboard still works if the video is absent.
-
-Step 7 — Create the backend
-
-Create backend/app.py and add the Flask application that:
-
-Scans serial ports using serial.tools.list_ports.
-
-Opens the Arduino port at 9600 baud.
-
-Reads newline-terminated JSON payloads.
-
-Validates sensor values and handles missing values as null.
-
-Writes readings into backend/sensor_data.db using Python's built-in sqlite3.
-
-Exposes GET /api/sensor with the latest readings, connection status, port details, and optional sensor fields.
-
-Serves the built frontend from frontend/dist/ and listens on 127.0.0.1:5000.
-
-Use the complete backend/app.py from the project repository when reproducing this exact version; it contains serial reconnection, database schema/upgrade logic, API response fields, and legacy CSV parsing that are too easy to omit in a short example.
-
-Step 8 — Configure Vite
-
-The Vite configuration should use the React plugin and allow the development server to be reached locally. The backend's production mode serves frontend/dist, so the regular launcher does not need to run Vite's development server.
-
-Step 9 — Create the Windows launcher
-
-Create start_app.bat in the project root. The launcher should:
-
-Locate the project folder relative to the batch file.
-
-Verify that port 5000 is not occupied by an unrelated application.
-
-Verify .venv\Scripts\python.exe and frontend\node_modules exist.
-
-Run npm --offline run build inside frontend.
-
-Start backend\app.py using the project's virtual-environment Python.
-
-Keep the terminal open while the dashboard is in use.
-
-The launcher supplied with this project performs these checks. If you change the port, update the launcher, Flask server, and API_URL in App.jsx together.
-
-Step 10 — Run the app
-
-From the project root in PowerShell:
-
+```powershell
 .\start_app.bat
+```
 
-Open http://localhost:5000/ in your browser if it does not open automatically. Keep the terminal running. Press Ctrl+C in that terminal to stop the backend.
+The launcher checks for the virtual environment and frontend dependencies,
+builds the frontend using locally installed npm packages in offline mode, and
+starts Flask. The backend opens `http://localhost:5000/` in your browser.
+Keep the terminal open while using the dashboard; press `Ctrl+C` in that
+terminal to stop the backend.
 
-For development with Vite hot reload, use two terminals:
+If the app cannot find the Arduino, check the configured COM port and USB
+cable. The dashboard and API can start while the board is disconnected, but
+they will report that live readings are unavailable.
 
-Terminal A — backend (from project root):
+## Development commands
 
+Use two PowerShell terminals from the repository root.
+
+**Terminal 1 - backend:**
+
+```powershell
 .\.venv\Scripts\python.exe backend\app.py
+```
 
-Terminal B — frontend:
+**Terminal 2 - Vite frontend:**
 
-cd frontend
-npm run dev
+```powershell
+npm --prefix frontend run dev
+```
 
-Vite will print its development URL, commonly http://localhost:5173/. The frontend fetches the API from port 5000. If you change the API address or use another device, configure the URL and network/firewall settings accordingly.
+Open the URL printed by Vite, usually `http://localhost:5173/`. The Vite
+frontend requests the Flask API at `http://127.0.0.1:5000`. Stop each process
+with `Ctrl+C` in its terminal.
 
-Arduino wiring
+Useful frontend commands from the repository root:
 
-Required HC-SR04
+```powershell
+npm --prefix frontend run lint
+npm --prefix frontend run build
+npm --prefix frontend run preview
+```
 
-HC-SR04 pin
+`build` creates `frontend/dist/`, which Flask serves in production mode.
+`preview` starts Vite's local preview server after a successful build.
 
-Arduino UNO
+### Check that the backend is responding
 
-VCC
+With the backend running, query the latest sensor response:
 
-5V
+```powershell
+Invoke-RestMethod http://localhost:5000/api/sensor | ConvertTo-Json -Depth 5
+```
 
-GND
+Query up to 50 recent records:
 
-GND
+```powershell
+Invoke-RestMethod http://localhost:5000/api/history | ConvertTo-Json -Depth 5
+```
 
-TRIG
+The backend also opens the dashboard automatically when it starts. You can
+open `http://localhost:5000/` or `http://localhost:5000/api/sensor` manually
+in a browser.
 
-D9
+## Serial protocol and API
 
-ECHO
+The current Arduino sketch sends a JSON object every two seconds, for example:
 
-D10
-
-Keep every module's ground connected to Arduino GND. Check each module's voltage requirements before connecting it; never allow a signal above the Arduino UNO's permitted input voltage. Avoid assigning one Arduino pin to two modules.
-
-Optional sensor pin map
-
-Module
-
-Signal pin in sketch
-
-Dashboard JSON key
-
-DHT11
-
-D2
-
-temperature, humidity
-
-PIR motion
-
-D3
-
-pir
-
-LDR
-
-A0
-
-ldr
-
-Soil moisture
-
-A1
-
-soil_moisture
-
-MQ-2 gas
-
-A2
-
-gas_level
-
-Rain sensor
-
-A3
-
-rain_level
-
-Water level
-
-A4
-
-water_level
-
-Flame sensor
-
-D4
-
-flame_detected
-
-IR obstacle
-
-D5
-
-ir_obstacle
-
-Sound sensor
-
-D6
-
-sound_detected
-
-Vibration sensor
-
-D7
-
-vibration_detected
-
-For digital modules, confirm whether the module's active signal is HIGH or LOW; sensor boards vary. Analog sensor values are raw ADC readings (typically 0–1023), not calibrated engineering units.
-
-Add optional sensors
-
-For each optional sensor in arduino/sensor.ino:
-
-Uncomment its pin definition near the top of the sketch.
-
-Uncomment its pinMode(...) line in setup() if required.
-
-Uncomment or add the reading logic in loop().
-
-Uncomment its matching printSensorField(...) output line.
-
-For DHT11, also uncomment #include <DHT.h>, the DHT declarations, dht.begin(), and temperature/humidity reads. Install DHT sensor library by Adafruit and Adafruit Unified Sensor through Arduino IDE Library Manager.
-
-Upload the sketch again.
-
-Close Serial Monitor and restart the dashboard if necessary.
-
-The JSON key sent by Arduino must match the key expected by the frontend. The current dashboard automatically builds cards for numeric keys it receives. ENABLED_OPTIONAL_SENSORS in frontend/src/App.jsx can be used to show selected cards before the first reading arrives.
-
-SQLite database
-
-SQLite is a file-based database built into Python. The application creates the database locally at:
-
-backend/sensor_data.db
-
-No separate database server or internet connection is needed. The backend's schema/initialization code is responsible for creating and upgrading the tables. Stop the app before manually copying or deleting the database.
-
-Keep history: back up sensor_data.db.
-
-Reset history: stop the app, back up the file if needed, then delete it; the backend should recreate it on next start.
-
-Git: normally ignore the .db file because it contains local runtime data.
-
-Supabase is not used in this local-only architecture. Supabase would require internet for remote synchronization unless you design a separate offline queue and later sync mechanism. For a single computer attached by USB to the Arduino, SQLite is simpler and truly local.
-
-API reference
-
-GET /api/sensor
-
-Example response shape (values vary by sensor and connection state):
-
+```json
 {
-  "api_version": 3,
-  "connected": true,
-  "serial_port": "COM3",
-  "available_ports": ["COM3"],
-  "temperature": null,
-  "humidity": null,
-  "distance": 24.5,
-  "extra_sensors": {
-    "sound_detected": 0,
-    "vibration_detected": 1
-  },
-  "timestamp": "2026-01-01T12:00:00"
+  "temperature": 23.0,
+  "humidity": 45.0,
+  "ldr": 610.0,
+  "light_percent": 59.6,
+  "panel_voltage": 2.5,
+  "daylight": 1.0,
+  "rain_analog": 810.0,
+  "rain_digital": 1.0,
+  "rain_detected": 0.0
 }
+```
 
-This is an illustrative shape, not a fixed reading. The precise fields are determined by backend/app.py. Test the running backend by opening http://localhost:5000/api/sensor in a browser.
+DHT readings are `null` if the sensor does not provide a valid reading. The
+backend stores the standard fields and any additional numeric fields under
+`extra_sensors`.
 
-Troubleshooting
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/sensor` | GET | Latest stored reading and serial connection status |
+| `/api/history` | GET | Up to 50 most recent readings |
+| `/` | GET | Production React app from `frontend/dist` |
 
-flowchart TD
-    A["Dashboard not working"] --> B{"Does localhost:5000 open?"}
-    B -->|No| C["Check Flask terminal and port 5000"]
-    B -->|Yes| D{"Does /api/sensor return JSON?"}
-    D -->|No| E["Check backend errors and Flask routes"]
-    D -->|Yes| F{"Is Arduino connected?"}
-    F -->|No| G["Check USB data cable, COM port, and Serial Monitor"]
-    F -->|Yes| H{"Are readings updating?"}
-    H -->|No| I["Check 9600 baud, newline JSON, sensor wiring, and parser"]
-    H -->|Yes| J["Project is operating normally"]
+The latest endpoint returns an object containing `api_version`, standard
+sensor fields, `timestamp`, `connected`, `serial_port`, `configured_port`,
+`available_ports`, and `extra_sensors`. When no reading has been saved yet,
+sensor values and timestamp are `null` and `extra_sensors` is empty.
 
-Dashboard says Arduino offline
+The backend defaults to `COM5` and 9600 baud. To override the COM port for
+one PowerShell session, use `$env:ARDUINO_PORT = "COM8"` (or `AUTO` to scan).
+The frontend polls the latest endpoint every second. The backend marks the
+sensor connection inactive after five seconds without a valid reading.
 
-Confirm the Arduino is connected with a USB data cable.
+## Database
 
-Upload the sketch to the correct board and COM port.
+The backend creates the SQLite database at:
 
-Ensure Serial Monitor is closed.
+```text
+backend/sensor_data.db
+```
 
-Check Windows Device Manager → Ports (COM & LPT) for the Arduino COM port.
+The database is local and is initialized automatically when `app.py` starts.
+Readings include the standard temperature, humidity, and distance columns,
+the timestamp, and a JSON field for additional sensor values. This firmware
+does not currently send a distance value, so it is normally `null`.
 
-Ensure the sketch and backend both use 9600 baud.
+To back up the database while the app is stopped:
 
-Wait a few seconds for the first valid sensor line.
+```powershell
+Copy-Item backend\sensor_data.db backend\sensor_data.backup.db
+```
 
-If auto-detection picks the wrong port, set ARDUINO_PORT to the correct port before starting the backend, for example:
+To intentionally reset history, stop the app, back up any data you want to
+keep, and then delete the database so it can be recreated at the next start:
 
-$env:ARDUINO_PORT = "COM3"
-.\.venv\Scripts\python.exe backend\app.py
+```powershell
+Remove-Item backend\sensor_data.db
+```
 
-Replace COM3 with the actual port. Clear the variable in the same terminal with Remove-Item Env:ARDUINO_PORT to return to automatic selection.
+Do not commit a local database containing personal or private data.
 
-ModuleNotFoundError: No module named 'serial' or flask
+## Troubleshooting
 
-Activate .venv and install backend/requirements.txt, or run pip through .venv\Scripts\python.exe.
+### Dashboard says the Arduino is offline
 
-npm or Vite is not found
+1. Check the USB data cable and Windows Device Manager's **Ports (COM & LPT)**.
+2. Set `$env:ARDUINO_PORT` to the correct COM port, or set it to `AUTO`.
+3. Confirm the sketch is uploaded to the right board and uses 9600 baud.
+4. Close Serial Monitor and any other program that could be using the COM port.
+5. Check that the DHT and other sensors are wired to the pins in the table.
+6. Wait for valid serial readings; the dashboard only marks live data online
+   after a valid sensor line has arrived.
 
-Install Node.js LTS, close and reopen the terminal, then verify node --version and npm --version. From frontend, run npm install.
+### `ModuleNotFoundError` for Flask or serial
 
-Port 5000 is already in use
+Install the backend requirements into the project environment:
 
-Stop the other application using port 5000. On Windows, inspect it with:
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+```
 
-netstat -ano | findstr :5000
+### npm, Vite, or frontend dependencies are missing
 
-Use the PID shown by the command to identify the process before stopping it. Do not terminate an unknown process blindly.
+Check Node.js and npm, then install frontend packages:
 
-Build fails in offline mode
+```powershell
+node --version
+npm --version
+npm --prefix frontend install
+```
 
-npm --offline run build only works if the required packages are already present in npm's local cache and frontend/node_modules is installed. Connect to the internet once and run npm install and npm run build; after that, normal local operation can be offline.
+### Port 5000 is already in use
 
-Database exists but readings are not changing
+Inspect the listening process before closing anything:
 
-Confirm the backend is receiving valid serial lines. Check the Arduino output in Serial Monitor only after stopping the backend, then close Serial Monitor before restarting the app.
+```powershell
+Get-NetTCPConnection -LocalPort 5000 -State Listen
+```
 
-Video does not appear
+Do not terminate an unknown process. Stop the application that owns the port,
+or configure this project and its frontend to use a different port together.
 
-Confirm the file exists in frontend/public/ and the filename matches VIDEO_URL in App.jsx. The video is decorative; missing video should not prevent sensor monitoring.
+### Offline frontend build fails
 
-Offline behaviour
+The launcher uses `npm --offline run build`. This requires Node.js, installed
+`frontend/node_modules`, and the needed packages in npm's local cache. While
+online, install and build once:
 
-After Python packages, Node dependencies, and any Arduino libraries have been installed, the system's normal runtime is local:
+```powershell
+npm --prefix frontend install
+npm --prefix frontend run build
+```
 
-Arduino data travels over USB.
+### Video background does not load
 
-Flask runs on the same computer.
+Confirm `frontend/public/Video Project 1.mp4` exists. The video is decorative;
+the dashboard has a fallback background and can still display sensor data
+without it.
 
-SQLite stores data on the same computer.
+## Offline operation
 
-The frontend is served from local build files.
+After Python dependencies, npm dependencies, and Arduino libraries have been
+installed:
 
-No Supabase account, hosted API, Wi-Fi, or cloud server is needed.
+- Sensor data moves over USB serial.
+- Flask and SQLite run on the local computer.
+- The production frontend is served from local build files.
+- The launcher builds from installed local npm packages in offline mode.
 
-Initial setup and dependency installation may require internet. The supplied Windows launcher builds from installed local npm packages in offline mode; it does not download dependencies.
+Initial installation may require an internet connection. Normal monitoring
+does not use a cloud service or require internet access.
 
-Git and clean repository
+## License
 
-Create a root .gitignore similar to:
-
-# Python
-.venv/
-__pycache__/
-*.py[cod]
-
-# Runtime database
-backend/*.db
-backend/*.db-shm
-backend/*.db-wal
-
-# Node
-node_modules/
-frontend/node_modules/
-
-# Vite generated output
-frontend/dist/
-
-# Environment / editor
-.env
-.env.*
-!.env.example
-.DS_Store
-
-Keep frontend/package-lock.json in Git for reproducible installs. Do not commit .venv/, node_modules/, dist/, Python cache files, or a live SQLite database. If the project intentionally ships a demo database, document that decision and ensure it contains no private data.
-
-Contributing
-
-Fork or clone the repository.
-
-Follow the setup steps above.
-
-Test with Arduino connected and disconnected.
-
-Check that /api/sensor returns JSON and the dashboard updates.
-
-Commit source code only; exclude generated files and local data.
-
-License
-
-Add your chosen open-source license here before publishing or accepting contributions.
-
-
-
+Add a license file and update this section before distributing the project
+under an open-source license.

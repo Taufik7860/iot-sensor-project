@@ -6,6 +6,7 @@ import threading
 import time
 import webbrowser
 from contextlib import closing
+from datetime import datetime
 
 import serial
 from serial.tools import list_ports
@@ -23,11 +24,11 @@ app = Flask(__name__, static_folder=FRONTEND_FOLDER)
 CORS(app)
 
 DB_FILE = os.path.join(BASE_DIR, "sensor_data.db")
-SERIAL_PORT = os.environ.get("ARDUINO_PORT", "AUTO").strip()
+SERIAL_PORT = os.environ.get("ARDUINO_PORT", "COM5").strip()
 BAUD_RATE = 9600
 SENSOR_TIMEOUT_SECONDS = 5
 MAX_DISTANCE_CM = 400
-API_VERSION = 3
+API_VERSION = 6
 
 hardware_state = {
     "connected": False,
@@ -210,10 +211,16 @@ def read_from_serial():
                     conn.execute(
                         """
                         INSERT INTO readings
-                            (temperature, humidity, distance, extra_sensors)
-                        VALUES (?, ?, ?, ?)
+                            (temperature, humidity, distance, timestamp, extra_sensors)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
-                        (temp, hum, dist, json.dumps(extra_sensors)),
+                        (
+                            temp,
+                            hum,
+                            dist,
+                            datetime.now().astimezone().isoformat(timespec="seconds"),
+                            json.dumps(extra_sensors),
+                        ),
                     )
             except sqlite3.Error as error:
                 print(f"[DATABASE ERROR] Could not save sensor reading: {error}")
@@ -267,6 +274,7 @@ def get_latest_sensor():
                 "timestamp": row[3],
                 "connected": is_live,
                 "serial_port": hardware_state["serial_port"],
+                "configured_port": SERIAL_PORT,
                 "available_ports": get_detected_serial_ports(),
                 "extra_sensors": json.loads(row[4] or "{}")
             }), 200
@@ -281,6 +289,7 @@ def get_latest_sensor():
         "timestamp": None,
         "connected": False,
         "serial_port": hardware_state["serial_port"],
+        "configured_port": SERIAL_PORT,
         "available_ports": get_detected_serial_ports(),
         "extra_sensors": {}
     }), 200
